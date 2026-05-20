@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import bisect
 import shutil
 
 from . import env as jit_env
@@ -21,8 +22,10 @@ from .core import JitSpec, gen_jit_spec
 from .utils import write_if_different
 
 
-# Sweep-tuned knob LUT for SM100 (B200) VAE problem sizes.
-# Format: (warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg)
+# Sweep-tuned point LUT for Blackwell (SM100 B200, SM103 B300) LLM-shape
+# problem sizes. Format: (warps_m, split_cols, kernel_cfg, occupancy,
+# bytes_per_ldg). Non-power-of-2 hidden sizes (C in {96, 192, 384}) used by
+# Wan2.2 VAE decoder shapes are covered by the range LUT below.
 _KNOB_LUT = {
     # C=64
     (64, 1560, "bf16"): (8, 0, 0, 2, 4),
@@ -154,8 +157,66 @@ _KNOB_LUT = {
     (1024, 399360, "nvfp4"): (32, 4, 1, 1, 16),
 }
 
-_SUPPORTED_C = [64, 128, 160, 256, 320, 512, 640, 1024]
-_SUPPORTED_TOKENS = [1560, 6240, 24960, 99840, 399360]
+# Range-based knob LUT. Key is (C, token_lo, token_hi, dtype) with half-open
+# interval token_lo <= num_tokens < token_hi. Each range maps to the knobs of
+# a single autotuned "anchor" shape (logged in the trailing comment). Generated
+# by sweep_fused_rmsnorm_silu_knobs.py with TP divisors (1, 2, 4, 8); range
+# boundaries are the geometric means of adjacent anchors so that any token
+# count projects to its nearest anchor on a log scale.
+_KNOB_LUT_RANGES = {
+    # C=96  (anchors=[66560, 133120, 266240, 532480, 1064960, 2129920])
+    (96, 0, 94130, "bf16"): (8, 0, 1, 16, 2),  # anchor=66560
+    (96, 94130, 188260, "bf16"): (8, 0, 1, 16, 2),  # anchor=133120
+    (96, 188260, 376520, "bf16"): (32, 0, 1, 2, 2),  # anchor=266240
+    (96, 376520, 753040, "bf16"): (32, 0, 1, 2, 2),  # anchor=532480
+    (96, 753040, 1506080, "bf16"): (32, 0, 1, 2, 2),  # anchor=1064960
+    (96, 1506080, 2147483648, "bf16"): (32, 0, 1, 2, 2),  # anchor=2129920
+    # C=192 (anchors=[4160, 8320, 16640, 33280, 66560, 133120, 266240, 532480])
+    (192, 0, 5883, "bf16"): (32, 0, 0, 1, 4),  # anchor=4160
+    (192, 5883, 11766, "bf16"): (32, 0, 0, 1, 4),  # anchor=8320
+    (192, 11766, 23532, "bf16"): (8, 0, 0, 9, 4),  # anchor=16640
+    (192, 23532, 47065, "bf16"): (8, 0, 1, 6, 4),  # anchor=33280
+    (192, 47065, 94130, "bf16"): (8, 0, 1, 16, 4),  # anchor=66560
+    (192, 94130, 188260, "bf16"): (32, 0, 0, 2, 4),  # anchor=133120
+    (192, 188260, 376520, "bf16"): (32, 0, 1, 2, 4),  # anchor=266240
+    (192, 376520, 2147483648, "bf16"): (32, 0, 1, 2, 4),  # anchor=532480
+    # C=384 (anchors=[1040, 2080, 4160, 8320, 16640, 33280, 66560])
+    (384, 0, 1470, "bf16"): (32, 0, 0, 1, 8),  # anchor=1040
+    (384, 1470, 2941, "bf16"): (32, 0, 0, 16, 4),  # anchor=2080
+    (384, 2941, 5883, "bf16"): (8, 0, 2, 4, 8),  # anchor=4160
+    (384, 5883, 11766, "bf16"): (32, 0, 2, 6, 4),  # anchor=8320
+    (384, 11766, 23532, "bf16"): (8, 0, 0, 4, 4),  # anchor=16640
+    (384, 23532, 47065, "bf16"): (8, 0, 0, 10, 4),  # anchor=33280
+    (384, 47065, 2147483648, "bf16"): (8, 0, 1, 16, 4),  # anchor=66560
+}
+
+
+def _build_range_index(lut):
+    """Bucket range entries by (C, dtype) and presort by lo for bisect lookup."""
+    by_key = {}
+    for (C, lo, hi, dtype), knobs in lut.items():
+        by_key.setdefault((C, dtype), []).append((lo, hi, knobs))
+    index = {}
+    for k, entries in by_key.items():
+        entries.sort(key=lambda x: x[0])
+        los = [e[0] for e in entries]
+        index[k] = (los, entries)
+    return index
+
+
+_KNOB_LUT_RANGES_INDEX = _build_range_index(_KNOB_LUT_RANGES)
+
+# Cartesian product enumerated by AOT to pre-compile every LUT-hit module.
+# Pairs absent from the LUTs fall back to _compute_default_knobs and dedupe by
+# knob URI (the fallback is independent of num_tokens).
+_SUPPORTED_C = [64, 96, 128, 160, 192, 256, 320, 384, 512, 640, 1024]
+_SUPPORTED_TOKENS = [
+    # LLM-shape token counts (covered by point LUT)
+    1560, 6240, 24960, 99840, 399360,
+    # Wan2.2 VAE anchors (covered by range LUT for C in {96, 192, 384})
+    1040, 2080, 4160, 8320, 16640, 33280, 66560, 133120, 266240, 532480,
+    1064960, 2129920,
+]
 
 
 def _compute_default_knobs(C: int, dtype: str):
@@ -184,13 +245,27 @@ def _compute_default_knobs(C: int, dtype: str):
 def select_knobs(C: int, num_tokens: int, dtype: str, sm_version: int = 100):
     """Select knobs from LUT or fallback heuristic.
 
-    For parity with the original integration:
-    - SM100+: use sweep-tuned LUT for known shapes.
-    - non-SM100 or non-LUT shapes: use conservative fallback heuristic.
+    Lookup order on SM100+:
+      1. Exact-point LUT (``_KNOB_LUT``) keyed by ``(C, num_tokens, dtype)``.
+      2. Range LUT (``_KNOB_LUT_RANGES``) keyed by
+         ``(C, token_lo, token_hi, dtype)``, matched when
+         ``token_lo <= num_tokens < token_hi``.
+      3. Conservative fallback via ``_compute_default_knobs``.
+
+    Non-SM100 (or no match anywhere) falls through to the fallback.
     """
-    key = (C, num_tokens, dtype)
-    if sm_version >= 100 and key in _KNOB_LUT:
-        return _KNOB_LUT[key]
+    if sm_version >= 100:
+        point = _KNOB_LUT.get((C, num_tokens, dtype))
+        if point is not None:
+            return point
+        bucket = _KNOB_LUT_RANGES_INDEX.get((C, dtype))
+        if bucket is not None:
+            los, entries = bucket
+            i = bisect.bisect_right(los, num_tokens) - 1
+            if i >= 0:
+                lo, hi, knobs = entries[i]
+                if lo <= num_tokens < hi:
+                    return knobs
     return _compute_default_knobs(C, dtype)
 
 
@@ -332,8 +407,13 @@ def gen_rmsnorm_silu_module(
 
     sources = []
     for fname in ["rmsnorm_silu.cu", "flashinfer_rmsnorm_silu_binding.cu"]:
+        src = jit_env.FLASHINFER_CSRC_DIR / fname
         dst = gen_directory / fname
-        shutil.copy(jit_env.FLASHINFER_CSRC_DIR / fname, dst)
+        # Preserve dst mtime when content is unchanged so ninja doesn't rebuild
+        # every time gen_rmsnorm_silu_module() is called.
+        src_bytes = src.read_bytes()
+        if not dst.exists() or dst.read_bytes() != src_bytes:
+            dst.write_bytes(src_bytes)
         sources.append(dst)
 
     return gen_jit_spec(
