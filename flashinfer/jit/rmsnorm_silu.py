@@ -190,6 +190,35 @@ _KNOB_RANGE_LUT_SM90 = {
 }
 
 
+# Range-based knob LUT for SM103 (B300), tuned on WAN VAE image-derived shapes.
+# Same key/value/match semantics as `_KNOB_RANGE_LUT_SM90` above; see
+# sweep_fused_rmsnorm_silu_knobs.py for the generator.
+_KNOB_RANGE_LUT_SM103 = {
+    # C=48  (anchors=[901120, 2088960])
+    (48, 0, 1372007, "bf16"): (4, 0, 0, 16, 4),  # anchor=901120
+    (48, 1372007, 2**31, "bf16"): (4, 0, 0, 16, 4),  # anchor=2088960
+    # C=96  (anchors=[225280, 460800, 522240, 1296000])
+    (96, 0, 322194, "bf16"): (32, 0, 1, 2, 2),  # anchor=225280
+    (96, 322194, 490559, "bf16"): (32, 0, 1, 2, 2),  # anchor=460800
+    (96, 490559, 822692, "bf16"): (32, 0, 1, 2, 2),  # anchor=522240
+    (96, 822692, 2**31, "bf16"): (32, 0, 1, 2, 2),  # anchor=1296000
+    # C=192  (anchors=[1760, 3520, 8160, 12240, 28160, 65280, 115200, 326400])
+    (192, 0, 2489, "bf16"): (32, 0, 0, 1, 2),  # anchor=1760
+    (192, 2489, 5359, "bf16"): (1, 0, 0, 10, 2),  # anchor=3520
+    (192, 5359, 9993, "bf16"): (8, 0, 2, 1, 2),  # anchor=8160
+    (192, 9993, 18565, "bf16"): (32, 0, 0, 8, 4),  # anchor=12240
+    (192, 18565, 42875, "bf16"): (8, 0, 0, 16, 4),  # anchor=28160
+    (192, 42875, 86719, "bf16"): (32, 0, 0, 2, 4),  # anchor=65280
+    (192, 86719, 193910, "bf16"): (32, 0, 0, 4, 4),  # anchor=115200
+    (192, 193910, 2**31, "bf16"): (32, 0, 1, 2, 4),  # anchor=326400
+    # C=384  (anchors=[1760, 8160, 14080, 48960])
+    (384, 0, 3789, "bf16"): (32, 0, 0, 5, 2),  # anchor=1760
+    (384, 3789, 10718, "bf16"): (8, 0, 0, 5, 4),  # anchor=8160
+    (384, 10718, 26255, "bf16"): (32, 0, 0, 1, 4),  # anchor=14080
+    (384, 26255, 2**31, "bf16"): (32, 0, 0, 1, 4),  # anchor=48960
+}
+
+
 def _lookup_range_lut(C: int, num_tokens: int, dtype: str, range_lut: dict):
     """Linear scan for an entry where token_lo <= num_tokens < token_hi.
 
@@ -248,11 +277,16 @@ def select_knobs(C: int, num_tokens: int, dtype: str, sm_version: int = 100):
     """Select knobs from LUT or fallback heuristic.
 
     For parity with the original integration:
+    - SM103 : use range-based LUT (token bucket lookup) tuned on B300.
     - SM100+: use sweep-tuned exact LUT for known shapes.
     - SM90  : use range-based LUT (token bucket lookup) tuned on H100.
     - other / non-LUT shapes: use conservative fallback heuristic.
     """
-    if sm_version >= 100:
+    if sm_version == 103:
+        knobs = _lookup_range_lut(C, num_tokens, dtype, _KNOB_RANGE_LUT_SM103)
+        if knobs is not None:
+            return knobs
+    elif sm_version >= 100:
         key = (C, num_tokens, dtype)
         if key in _KNOB_LUT:
             return _KNOB_LUT[key]
