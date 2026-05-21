@@ -6,7 +6,7 @@
 For each (B,C,T,H,W) shape that hits the fused path during a Wan VAE decode,
 times:
   - REF:   WanRMS_norm(x) followed by SiLU (the original path)
-  - FUSED: _fused_rmsnorm_silu_5d (flashinfer.norm.fused_rmsnorm_silu)
+  - FUSED: flashinfer.norm.fused_rmsnorm_silu (with 5D permute+reshape wrapper)
 
 Inputs are placed in channels_last_3d, matching what test_autoencoder_kl_wan.py
 does to the loaded VAE. The shapes file is the 3-column format:
@@ -46,6 +46,21 @@ def parse_shape_file(path: str) -> List[Tuple[int, int, int, int, int]]:
     return out
 
 
+def _fused_rmsnorm_silu_5d(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+    # Channel-dim RMSNorm + SiLU on [B,C,T,H,W] via flashinfer.norm.fused_rmsnorm_silu.
+    # When x is channels_last_3d the permute+reshape is zero-copy; otherwise we
+    # force last-dim contiguity (required by the kernel). Output is laid out so
+    # that channels_last_3d is preserved for downstream convs.
+    import flashinfer.norm
+
+    B, C, T, H, W = x.shape
+    x2 = x.permute(0, 2, 3, 4, 1).reshape(-1, C)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    y2 = flashinfer.norm.fused_rmsnorm_silu(x2, gamma.view(-1))
+    return y2.view(B, T, H, W, C).permute(0, 4, 1, 2, 3)
+
+
 def bench_one(
     shape: Tuple[int, int, int, int, int],
     dtype: torch.dtype,
@@ -53,10 +68,7 @@ def bench_one(
     warmup: int,
     iters: int,
 ):
-    from diffusers.models.autoencoders.autoencoder_kl_wan import (
-        WanRMS_norm,
-        _fused_rmsnorm_silu_5d,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 
     B, C, T, H, W = shape
     x = torch.randn(*shape, dtype=dtype, device=device).contiguous(
