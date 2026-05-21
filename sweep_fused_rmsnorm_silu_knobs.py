@@ -117,7 +117,12 @@ _QUICK_SPLIT_COLS = (0, 4)
 
 
 def _valid_for_ctas_per_row_1(C: int, bpl: int) -> bool:
-    """Mirror the validity check in `_compute_default_knobs` for ctas_per_row=1."""
+    """Mirror the validity check in `_compute_default_knobs` for ctas_per_row=1.
+
+    The kernel emits a predicated tail LDG when ``VEC_COLS`` is not a multiple
+    of ``VEC_COLS_PER_LDG``, so the only hard requirement (for bf16) is
+    ``C % NUM_ELTS == 0`` so the vectorized loads stay aligned.
+    """
     if bpl < 2 or bpl % 2 != 0:
         return False
     num_elts = bpl // 2  # bf16
@@ -125,9 +130,9 @@ def _valid_for_ctas_per_row_1(C: int, bpl: int) -> bool:
         return False
     vec_cols = C // num_elts
     vec_cols_per_ldg = 1 * 1 * 32  # ctas_per_row * warps_n * 32
-    if vec_cols % vec_cols_per_ldg != 0:
+    if vec_cols_per_ldg <= 0:
         return False
-    ldgs = vec_cols // vec_cols_per_ldg
+    ldgs = (vec_cols + vec_cols_per_ldg - 1) // vec_cols_per_ldg  # ceil
     return 0 < ldgs <= 1024
 
 
