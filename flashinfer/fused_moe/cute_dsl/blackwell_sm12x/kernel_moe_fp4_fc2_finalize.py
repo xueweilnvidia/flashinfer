@@ -56,7 +56,15 @@ REG_PROD_BY_TACTIC = {
 SCATTER_EPIS = (EpiMethod.WG_SCATTER,)
 
 
-def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
+def make_cfg(
+    tile,
+    ab_stage,
+    epi=EpiMethod.WG_SCATTER,
+    enable_pdl=False,
+    separate_epilogue=False,
+    store_warps=0,
+):
+    assert store_warps in (0, 1, 2, 4)
     fp4, f32, bf16, sf = (
         cutlass.Float4E2M1FN,
         cutlass.Float32,
@@ -68,18 +76,34 @@ def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
         f"{epi} is not implemented here; this epilogue scatters into rows"
     )
     tactic = (tile[0], tile[1], epi)
-    return Sm12xGemmConfig(
+    epi_cfg = EPI_CONFIGS[epi](
+        bf16, 8 * 32, store_threads=store_warps * 32 if store_warps else None
+    )
+    if store_warps:
+        epi_cfg.HAS_STORE_WARP = True
+        separate_epilogue = True
+    cfg = Sm12xGemmConfig(
         MmaConfig(warp_mma.MmaMXF4NVF4Op(fp4, f32, sf), tile[:2], 8),
         LoadABConfig(tile, ab_stage, fp4, fp4),
         Sm120SfConfigNvfp4(sf),
-        EPI_CONFIGS[epi](bf16, 8 * 32),
+        epi_cfg,
         ab_stage,
         tile,
         epi_bar_id=3,
-        union_smem=True,
+        union_smem=not separate_epilogue,
         reg_prod=REG_PROD_BY_TACTIC[tactic],
         enable_pdl=enable_pdl,
     )
+    if store_warps:
+        # Warp 11 is already allocated but unused by the ordinary epilogue.
+        # Additional store warps require another whole producer warpgroup.
+        producer_warps = 4 if store_warps == 1 else 8
+        cfg.num_wg = 2 + producer_warps // 4
+        cfg.threads = cfg.num_wg * 128
+        cfg.epi_threads = cfg.mma_threads + store_warps * 32
+        cfg.num_sched_consumers = cfg.num_math_warps + 2 + store_warps
+        cfg.reg_math = cfg._reg_math(cfg.num_math_warps, producer_warps, cfg.reg_prod)
+    return cfg
 
 
 def make_decode_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
@@ -208,6 +232,7 @@ def copy_a_sfa(
     ab_stages,
     stage,
     phase,
+    cache_policy=None,
 ):
     for kt in cutlass.range(0, k_tile_count):
         cute.arch.mbarrier_wait(a_empty + stage, phase)
@@ -218,6 +243,7 @@ def copy_a_sfa(
             tAgA[(None, tile.m_block, kt)],
             tAsA[(None, stage)],
             tma_bar_ptr=a_full + stage,
+            cache_policy=cache_policy,
         )
         cute.copy(
             tma_atom_sfa,
@@ -325,21 +351,28 @@ def mma(
     sf_blocks = cute.size(tCrSFA_v, mode=[2])
     acc.fill(0.0)
     for _ in cutlass.range(0, k_tile_count):
+        # A/SFA and B/SFB arrive on separate barriers from separate load warps.
+        # Copy A to registers and release its stage before waiting on B, so the
+        # A loader can refill early and the B wait overlaps the A shared-memory
+        # reads. On SM120 (RTX PRO 6000, 16384 tokens, H=4096, I=768, E=384,
+        # top-k 20) this is 1.3-2.6% faster than waiting on both first.
         cute.arch.mbarrier_wait(a_full + stage, phase)
-        cute.arch.mbarrier_wait(b_full + stage, phase)
         tAsA = thr_a.partition_S(sA)[None, None, None, stage]
-        tBsB = thr_b.partition_S(sB)[None, None, None, stage]
         tAsSFA = thr_sfa.partition_S(sSFA)[None, None, None, stage]
-        tBsSFB = thr_sfb.partition_S(sSFB)[None, None, None, stage]
         for k in cutlass.range_constexpr(0, k_blocks):
             cute.copy(s2r_a, tAsA[None, None, k], tCrA_v[None, None, k])
-            cute.copy(s2r_b, tBsB[None, None, k], tCrB_v[None, None, k])
         for k in cutlass.range_constexpr(0, sf_blocks):
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
-            cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
-        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
         cute.arch.mbarrier_arrive(a_empty + stage)
+        cute.arch.mbarrier_wait(b_full + stage, phase)
+        tBsB = thr_b.partition_S(sB)[None, None, None, stage]
+        tBsSFB = thr_sfb.partition_S(sSFB)[None, None, None, stage]
+        for k in cutlass.range_constexpr(0, k_blocks):
+            cute.copy(s2r_b, tBsB[None, None, k], tCrB_v[None, None, k])
+        for k in cutlass.range_constexpr(0, sf_blocks):
+            cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
         cute.arch.mbarrier_arrive(b_empty + stage)
+        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
         stage += 1
         if stage == ab_stages:
             stage = cutlass.Int32(0)
@@ -565,9 +598,11 @@ def mma_multistage(
 
 
 class CuteDslSm120MoeNvfp4Fc2Finalize:
-    def __init__(self, cfg, grid_x):
+    def __init__(self, cfg, grid_x, swizzle_size=0, use_l2_hints=False):
         self.cfg = cfg
         self.grid_x = grid_x
+        self.swizzle_size = swizzle_size
+        self.use_l2_hints = use_l2_hints
         self.mma = cfg.mma
         self.sf = cfg.load_sf
         self.num_math_warps = cfg.num_math_warps
@@ -676,6 +711,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
             b_full: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
             b_empty: cute.struct.MemRange[cfg.I64, cfg.ab_stage]
             epi_empty: cute.struct.MemRange[cfg.I64, epi_empty_bars]
+            epi_full: cute.struct.MemRange[cfg.I64, cfg.epi.num_full_barriers]
             sfull: cute.struct.MemRange[cfg.I64, cfg.sched_stages]
             sempty: cute.struct.MemRange[cfg.I64, cfg.sched_stages]
             work: cute.struct.MemRange[cfg.I32, cfg.sched_stages * cfg.fields]
@@ -804,6 +840,11 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
         epi_empty = (
             stg.epi_empty.data_ptr() if cutlass.const_expr(epi_empty_bars > 0) else None
         )
+        epi_full = (
+            stg.epi_full.data_ptr()
+            if cutlass.const_expr(cfg.epi.HAS_STORE_WARP)
+            else None
+        )
         sfull, sempty = stg.sfull.data_ptr(), stg.sempty.data_ptr()
         sWork = stg.work.get_tensor(cute.make_layout((cfg.sched_stages, cfg.fields)))
 
@@ -818,6 +859,8 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     cute.arch.mbarrier_init(
                         epi_empty + s, cfg.epi.empty_barrier_arrivals
                     )
+                if cutlass.const_expr(cfg.epi.HAS_STORE_WARP):
+                    cute.arch.mbarrier_init(epi_full, cfg.mma_threads)
                 for s in cutlass.range_constexpr(cfg.sched_stages):
                     cute.arch.mbarrier_init(sfull + s, 1)
                     cute.arch.mbarrier_init(sempty + s, self.num_sched_consumers)
@@ -828,24 +871,44 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
             cute.arch.setmaxregister_decrease(self.reg_prod)
 
             if warp_idx == self.sched_warp:
-                sched = moe_scheduler.MoeTileScheduler.create(
-                    bm, num_groups, num_n_blocks, self.grid_x, bidx, offsets
-                )
                 prod = moe_scheduler.MoeSchedProducer.create(cfg.sched_stages)
-                has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
-                while has:
-                    prod.publish(
-                        sWork,
-                        sfull,
-                        sempty,
-                        moe_scheduler.MoeWorkTile(
-                            m_tile, n_tile, e, m_off, m_bnd, i32(1)
-                        ),
+                # Reduce a narrow output-column band across all experts before
+                # visiting the next band, keeping its random token rows in L2.
+                n_band = num_n_blocks
+                if cutlass.const_expr(self.swizzle_size > 0):
+                    n_band = self.swizzle_size
+                for n_base in cutlass.range(0, num_n_blocks, n_band):
+                    sched = moe_scheduler.MoeTileScheduler.create(
+                        bm,
+                        num_groups,
+                        cute.min(n_band, num_n_blocks - n_base),
+                        self.grid_x,
+                        bidx,
+                        offsets,
                     )
                     has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(offsets)
+                    while has:
+                        prod.publish(
+                            sWork,
+                            sfull,
+                            sempty,
+                            moe_scheduler.MoeWorkTile(
+                                m_tile, n_base + n_tile, e, m_off, m_bnd, i32(1)
+                            ),
+                        )
+                        has, e, m_tile, n_tile, m_off, m_bnd = sched.get_next_block(
+                            offsets
+                        )
                 prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_0:
+                a_l2_policy = None
+                if cutlass.const_expr(self.use_l2_hints):
+                    a_l2_policy = cute.arch.inline_ptx(
+                        "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+                        write_only_types=[cutlass.Int64],
+                        read_only_args=[],
+                    )
                 if cutlass.const_expr(cfg.enable_pdl):
                     cute.arch.griddepcontrol_wait()
                 wstage, wphase = i32(0), i32(1)
@@ -884,6 +947,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         cfg.ab_stage,
                         wstage,
                         wphase,
+                        cache_policy=a_l2_policy,
                     )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
@@ -924,6 +988,39 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                     )
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
+            if cutlass.const_expr(cfg.epi.HAS_STORE_WARP):
+                if (
+                    warp_idx >= cfg.store_warp
+                    and warp_idx < cfg.store_warp + cfg.epi.num_store_threads // 32
+                ):
+                    store_tidx = tidx - cfg.store_warp * 32
+                    store_s2r = tiled_s2r.get_slice(store_tidx)
+                    store_phase = i32(0)
+                    cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
+                    tile = cons.get_next_tile(sWork, sfull, sempty)
+                    while tile.valid != i32(0):
+                        cute.arch.mbarrier_wait(epi_full, store_phase)
+                        m_base = tile.m_offset + tile.m_block * bm
+                        m_valid = cute.min(
+                            cute.max(tile.m_boundary - m_base, i32(0)), i32(bm)
+                        )
+                        moe_epilogue.smem_to_gmem_scatter(
+                            store_s2r,
+                            sC,
+                            sTok,
+                            sWt,
+                            gD,
+                            (bm, bn),
+                            tile.n_block * bn,
+                            N,
+                            m_valid,
+                            self.use_l2_hints,
+                        )
+                        # Release only after every store thread has finished reading C.
+                        cute.arch.mbarrier_arrive(epi_empty)
+                        store_phase ^= 1
+                        tile = cons.get_next_tile(sWork, sfull, sempty)
+
         else:
             cute.arch.setmaxregister_increase(self.reg_math)
             thr_r2s = tiled_r2s.get_slice(tidx)
@@ -931,6 +1028,7 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
             if cutlass.const_expr(cfg.enable_pdl):
                 cute.arch.griddepcontrol_wait()
             rstage, rphase = i32(0), i32(0)
+            c_empty_phase = i32(1)
             cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
             tile = cons.get_next_tile(sWork, sfull, sempty)
             while tile.valid != i32(0):
@@ -983,25 +1081,43 @@ class CuteDslSm120MoeNvfp4Fc2Finalize:
                         cutlass.Float32
                     )
                 )
-                moe_epilogue.store_wg_scatter(
-                    acc,
-                    thr_r2s,
-                    thr_s2r,
-                    sC,
-                    sTok,
-                    sWt,
-                    gTok,
-                    gWt,
-                    gD,
-                    tile,
-                    (bm, bn),
-                    N,
-                    cfg.epi.out_dtype,
-                    epi_empty,
-                    cfg.epi_bar_id,
-                    cfg.mma_threads,
-                    tidx,
-                )
+                if cutlass.const_expr(cfg.epi.HAS_STORE_WARP):
+                    cute.arch.mbarrier_wait(epi_empty, c_empty_phase)
+                    moe_epilogue.rmem_to_smem(
+                        moe_epilogue.convert_acc(acc, cfg.epi.out_dtype), thr_r2s, sC
+                    )
+                    m_base = tile.m_offset + tile.m_block * bm
+                    m_valid = cute.min(
+                        cute.max(tile.m_boundary - m_base, i32(0)), i32(bm)
+                    )
+                    if tidx < bm:
+                        moe_epilogue.stage_scatter_meta(
+                            sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bm
+                        )
+                    # Each math thread publishes its shared-memory writes with release semantics.
+                    cute.arch.mbarrier_arrive(epi_full)
+                    c_empty_phase ^= 1
+                else:
+                    moe_epilogue.store_wg_scatter(
+                        acc,
+                        thr_r2s,
+                        thr_s2r,
+                        sC,
+                        sTok,
+                        sWt,
+                        gTok,
+                        gWt,
+                        gD,
+                        tile,
+                        (bm, bn),
+                        N,
+                        cfg.epi.out_dtype,
+                        epi_empty,
+                        cfg.epi_bar_id,
+                        cfg.mma_threads,
+                        tidx,
+                        evict_last=self.use_l2_hints,
+                    )
                 tile = cons.get_next_tile(sWork, sfull, sempty)
 
 

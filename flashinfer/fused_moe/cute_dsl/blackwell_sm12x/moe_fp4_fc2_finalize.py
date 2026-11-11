@@ -72,7 +72,16 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
     TILES = TILES
 
     def __init__(
-        self, n: int, k: int, tile, epi: EpiMethod = DEFAULT_EPI, enable_pdl=False
+        self,
+        n: int,
+        k: int,
+        tile,
+        epi: EpiMethod = DEFAULT_EPI,
+        enable_pdl=False,
+        swizzle_size=0,
+        use_l2_hints=False,
+        separate_epilogue=False,
+        store_warps=0,
     ):
         if not self.can_implement(n=n, k=k, tile=tile, epi=epi):
             raise TypeError(
@@ -81,10 +90,34 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
             )
         self.n, self.k, self.tile = n, k, tuple(tile)
         self.epi, self.enable_pdl = epi, enable_pdl
+        self.swizzle_size, self.use_l2_hints = swizzle_size, use_l2_hints
+        self.store_warps = store_warps
+        if not isinstance(store_warps, int) or store_warps not in (0, 1, 2, 4):
+            raise ValueError("store_warps must be 0, 1, 2, or 4")
+        separate_epilogue = separate_epilogue or bool(store_warps)
+        self.separate_epilogue = separate_epilogue
+        if not isinstance(swizzle_size, int) or swizzle_size < 0:
+            raise ValueError("swizzle_size must be a nonnegative integer")
+        if is_swapab(self.tile) and (swizzle_size or use_l2_hints or separate_epilogue):
+            raise ValueError("FC2 epilogue options require the persistent kernel")
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
         _, cfg_factory = select_kernel(self.tile)
         self.cfg = cfg_factory(self.tile, self.ab_stage, epi=epi, enable_pdl=enable_pdl)
+        if separate_epilogue:
+            self.cfg = make_cfg(
+                self.tile,
+                self.ab_stage,
+                epi=epi,
+                enable_pdl=enable_pdl,
+                separate_epilogue=True,
+                store_warps=store_warps,
+            )
+            if (
+                self.cfg.smem_bytes + self.cfg.MBAR_RESERVE
+                > cutlass.utils.SmemAllocator.capacity_in_bytes()
+            ):
+                raise ValueError("separate FC2 epilogue exceeds shared-memory capacity")
 
     @classmethod
     def is_constructible(cls, tile, epi: EpiMethod = DEFAULT_EPI) -> bool:
@@ -121,6 +154,8 @@ class CuteDslSm120GroupedNvfp4Fc2FinalizeOp:
 
     def build(self, grid_x: int):
         kernel_type, _ = select_kernel(self.tile)
+        if not is_swapab(self.tile):
+            return kernel_type(self.cfg, grid_x, self.swizzle_size, self.use_l2_hints)
         return kernel_type(self.cfg, grid_x)
 
     def get_grid_size(self, total_rows: int, num_experts: int, num_sms: int):
@@ -152,7 +187,16 @@ def compiled_kernel(
     grid_x: int,
     sm_version: str,
 ):
-    key = (op.tactic, op.enable_pdl, grid_x, sm_version)
+    key = (
+        op.tactic,
+        op.enable_pdl,
+        grid_x,
+        sm_version,
+        op.swizzle_size,
+        op.use_l2_hints,
+        op.separate_epilogue,
+        op.store_warps,
+    )
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)
@@ -271,7 +315,27 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
     out: torch.Tensor | None = None,
     worklist: torch.Tensor | None = None,
     workcount: torch.Tensor | None = None,
+    swizzle_size: int = 0,
+    use_l2_hints: bool = False,
+    separate_epilogue: bool = False,
+    store_warps: int = 0,
 ):
+    """Run FC2 with weighted BF16 atomic finalize.
+
+    The optional persistent-kernel controls are explicit experiments, not
+    autotuned: ``swizzle_size`` visits that many N tiles across all experts
+    before the next column band (0 retains the original traversal);
+    ``use_l2_hints`` loads A evict-first and reduces output evict-last;
+    ``separate_epilogue`` gives C its own shared memory so input loads can
+    overlap finalize. ``store_warps`` (1, 2, or 4; default 0) delegates scatter
+    to dedicated warps and implies separate epilogue storage. The math warps
+    may compute the next tile while those warps drain the single C buffer.
+    One store warp uses 384 threads; two or four use 512 threads per CTA.
+    These options require a non-decode tile and sufficient
+    shared memory. Set ``tile`` explicitly when comparing configurations.
+
+    A caller-provided ``out`` must be zeroed before each invocation.
+    """
     assert not enable_pdl or out is not None, "PDL requires caller-owned out"
     _validate_inputs(
         a_q,
@@ -326,7 +390,17 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
                 num_experts=int(b_q.shape[0]),
                 num_sms=num_sms,
             )
-        op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
+        op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(
+            n,
+            k,
+            tuple(tile),
+            epi,
+            enable_pdl,
+            swizzle_size,
+            use_l2_hints,
+            separate_epilogue,
+            store_warps,
+        )
         grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
         if out is None:
             out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)

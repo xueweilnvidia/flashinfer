@@ -628,7 +628,16 @@ def stage_scatter_meta(sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bm):
 
 @cute.jit
 def smem_to_gmem_scatter(
-    thr_s2r, sC, sTok, sWt, gOut, tile_mn, n_base, hidden, m_valid
+    thr_s2r,
+    sC,
+    sTok,
+    sWt,
+    gOut,
+    tile_mn,
+    n_base,
+    hidden,
+    m_valid,
+    evict_last: cutlass.Constexpr = False,
 ):
     bm, bn = tile_mn
     f32 = cutlass.Float32
@@ -650,7 +659,7 @@ def smem_to_gmem_scatter(
             v4, v5 = w * reg[4].to(f32), w * reg[5].to(f32)
             v6, v7 = w * reg[6].to(f32), w * reg[7].to(f32)
             if local < m_valid:
-                emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7)
+                emit_scatter(gOut, base, v0, v1, v2, v3, v4, v5, v6, v7, evict_last)
 
 
 @cute.jit
@@ -672,6 +681,7 @@ def store_wg_scatter(
     epi_bar_id,
     mma_threads,
     tidx,
+    evict_last: cutlass.Constexpr = False,
 ):
     bm, bn = tile_mn
     i32 = cutlass.Int32
@@ -682,7 +692,16 @@ def store_wg_scatter(
     stage_scatter_meta(sTok, sWt, gTok, gWt, m_base, m_valid, tidx, bm)
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     smem_to_gmem_scatter(
-        thr_s2r, sC, sTok, sWt, gOut, (bm, bn), tile.n_block * bn, hidden, m_valid
+        thr_s2r,
+        sC,
+        sTok,
+        sWt,
+        gOut,
+        (bm, bn),
+        tile.n_block * bn,
+        hidden,
+        m_valid,
+        evict_last,
     )
     cute.arch.barrier(barrier_id=epi_bar_id, number_of_threads=mma_threads)
     if cutlass.const_expr(epi_empty is not None):

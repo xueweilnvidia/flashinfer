@@ -3,6 +3,7 @@
 """Native SM12x NVFP4 chain correctness and shared route consumers."""
 
 import importlib
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +140,117 @@ def test_nvfp4_fc2_tuning_reuses_public_entry(monkeypatch, explicit_tactic):
             ),
         )
     ]
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize(
+    "swizzle_size,use_l2_hints,separate_epilogue",
+    [
+        (0, False, True),
+        (3, False, False),
+        (3, True, False),
+        (3, False, True),
+        (3, True, True),
+        (8, False, True),
+    ],
+)
+def test_nvfp4_fc2_column_bands(
+    monkeypatch, cuda_matmul_flags, swizzle_size, use_l2_hints, separate_epilogue
+):
+    if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("requires an SM120a device")
+    cuda_matmul_flags(allow_tf32=False)
+    # Five N tiles exercise both a short final band and a band wider than N.
+    # The padded routing fixture leaves the final output token unrouted.
+    data = Fixture(
+        "qwen30b",
+        257,
+        shape_override=(640, 512, 4, 2),
+        padded_routes=True,
+        per_expert_scales=True,
+    )
+    launch = data.fc2.cute_dsl_sm12x_fc2_finalize_nvfp4
+    monkeypatch.setattr(
+        data.fc2,
+        "cute_dsl_sm12x_fc2_finalize_nvfp4",
+        partial(
+            launch,
+            tile=(128, 128, 128),
+            swizzle_size=swizzle_size,
+            use_l2_hints=use_l2_hints,
+            separate_epilogue=separate_epilogue,
+        ),
+    )
+    immutable = data.input_hashes()
+    data.check(data.native().clone())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = data.native()
+    for _ in range(2):
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        data.check(output.clone())
+        assert torch.count_nonzero(output[-1]).item() == 0
+    assert data.input_hashes() == immutable
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize(
+    "bm,swizzle,stores,pdl,tokens,experts",
+    [
+        (128, 3, 1, False, 257, 4),
+        (128, 3, 2, True, 257, 4),
+        (128, 8, 4, False, 257, 4),
+        (128, 3, 4, True, 17, 32),
+        (64, 3, 4, False, 257, 4),
+        (32, 3, 4, False, 257, 4),
+    ],
+)
+def test_nvfp4_fc2_store_pipeline(
+    monkeypatch, cuda_matmul_flags, bm, swizzle, stores, pdl, tokens, experts
+):
+    if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("requires an SM120a device")
+    cuda_matmul_flags(allow_tf32=False)
+    data = Fixture(
+        "qwen30b",
+        tokens,
+        shape_override=(640, 512, experts, 2),
+        padded_routes=True,
+        per_expert_scales=True,
+    )
+    # Force the persistent FC2 even when this tiny case would select decode.
+    data.fc2_work = None
+    original = data.fc2.cute_dsl_sm12x_fc2_finalize_nvfp4
+    inputs_before = data.input_hashes()
+    graphs = []
+    for store_count in (0, stores):
+        monkeypatch.setattr(
+            data.fc2,
+            "cute_dsl_sm12x_fc2_finalize_nvfp4",
+            partial(
+                original,
+                tile=(bm, 128, 128),
+                swizzle_size=swizzle,
+                separate_epilogue=True,
+                store_warps=store_count,
+            ),
+        )
+        data.check(data.native(pdl).clone())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = data.native(pdl)
+        graphs.append(g)
+    # Both old and new captures must remain valid after changing the tactic.
+    for _ in range(2):
+        for graph in graphs:
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            data.check(output.clone())
+            assert torch.count_nonzero(output[-1]).item() == 0
+    assert data.input_hashes() == inputs_before
 
 
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
